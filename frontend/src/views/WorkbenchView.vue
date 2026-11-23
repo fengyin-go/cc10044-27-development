@@ -70,6 +70,8 @@
       </tbody>
     </table>
 
+    <RollbackPanel v-if="meta.key === 'schema_change' || meta.key === 'catalog_sync'" />
+
     <div v-if="showCreate" class="modal-backdrop" data-testid="create-modal">
       <form class="modal" @submit.prevent="submitCreate">
         <h3>登记{{ meta.entity }}</h3>
@@ -104,6 +106,7 @@ import {
   runAction as applyAction,
 } from '@/api/backend-service'
 import type { EntryRow } from '@/data/types'
+import RollbackPanel from '@/views/RollbackPanel.vue'
 
 const props = defineProps<{ moduleKey: string }>()
 const meta = moduleMeta(props.moduleKey)

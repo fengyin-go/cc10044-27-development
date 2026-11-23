@@ -64,6 +64,16 @@ SEED_ROWS: dict[str, list[dict[str, Any]]] = {
         {"id": 3, "status": "已回退", "pending": False, "abnormal": True,
          "目标表": "dws_sales_agg", "变更类型": "DROP_COLUMN", "变更内容": "误删字段 customer_segment",
          "影响下游表数": "8", "变更时间": "2026-09-01"},
+        # 同一张表两次独立发布的变更：先改金额类型，后补 channel 列。
+        # 回退金额改型时，channel 必须继续可读。
+        {"id": 4, "status": "已执行", "pending": False, "abnormal": False,
+         "目标表": "order_fact_v3", "变更类型": "MODIFY_TYPE",
+         "变更内容": "amount 由 DECIMAL(10,2) 改为 STRING",
+         "影响下游表数": "2", "变更时间": "2026-11-18", "回退状态": "未提交"},
+        {"id": 5, "status": "已执行", "pending": False, "abnormal": False,
+         "目标表": "order_fact_v3", "变更类型": "ADD_COLUMN",
+         "变更内容": "新增字段 channel STRING",
+         "影响下游表数": "2", "变更时间": "2026-11-21", "回退状态": "未提交"},
     ],
     "lineage_graph": [
         {"id": 1, "status": "已建立", "pending": False, "abnormal": False,
@@ -78,6 +88,11 @@ SEED_ROWS: dict[str, list[dict[str, Any]]] = {
         {"id": 4, "status": "已断裂", "pending": False, "abnormal": True,
          "目标表": "report_monthly_finance", "来源表列表": "legacy_gl_journal, dim_fiscal_period",
          "转换逻辑": "财务月报汇总", "中间层级": "报表", "血缘深度": "2"},
+        {"id": 5, "status": "已建立", "pending": False, "abnormal": False,
+         "目标表": "order_fact_v3", "来源表列表": "ods_orders, dim_channel",
+         "转换逻辑": "订单事实清洗，金额与渠道按当前列定义读取", "中间层级": "DWD",
+         "血缘深度": "2", "列定义版本": "amount:STRING, channel:STRING",
+         "读取路径": "report_order_amount_sum"},
     ],
     "backfill_task": [
         {"id": 1, "status": "运行中", "pending": True, "abnormal": False,
@@ -252,5 +267,10 @@ SEED_ROWS: dict[str, list[dict[str, Any]]] = {
          "任务名称": "Hive_to_HMS_legacy_sync", "源Catalog": "hive_metastore_legacy",
          "目标Catalog": "hms_production", "同步范围": "全部",
          "同步状态": "失败-Schema冲突2处"},
+        # 承载 order_fact_v3 的目录同步任务：Schema回退的目录确认落在这一条上。
+        {"id": 4, "status": "已同步", "pending": False, "abnormal": False,
+         "任务名称": "Hive_to_Glue_order_fact_sync", "源Catalog": "hive_metastore_prod",
+         "目标Catalog": "aws_glue_catalog", "同步范围": "ods_orders,order_fact_v3",
+         "同步状态": "完成"},
     ],
 }

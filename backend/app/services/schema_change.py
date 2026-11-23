@@ -7,6 +7,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.schema_registry import schema_registry
 from app.store import store
 
 
@@ -14,13 +15,35 @@ class SchemaChangeService(BaseModuleService):
     MODULE = "schema_change"
     ENTITY = "变更记录"
     OPERATION_TERM = "校验"
-    LIST_FIELDS = ["目标表", "变更类型", "变更内容", "影响下游表数", "变更时间"]
+    LIST_FIELDS = ["目标表", "变更类型", "变更内容", "影响下游表数", "变更时间", "回退状态"]
     REQUIRED_FIELDS = ["目标表", "变更类型", "变更内容"]
     STATUS_ORDER = ["待审批", "已执行", "已回退"]
+    # 回退变更进入两段式流程（提交办理 -> 目录确认结案），由 run_action 覆写分派。
     ACTION_RULES = {"执行变更": "待审批", "回退变更": "已回退"}
     NEGATIVE_ACTIONS = []
 
     CHANGE_TYPES = frozenset({"ADD_COLUMN", "DROP_COLUMN", "MODIFY_TYPE", "RENAME_COLUMN", "RENAME_TABLE"})
+
+    def create_entry(self, values: dict[str, Any]) -> tuple[dict[str, Any] | None, list[str]]:
+        """登记变更记录：回退状态默认「未提交」，避免新记录出现在待办里。"""
+        entry, missing = super().create_entry(values)
+        if entry is not None:
+            entry["回退状态"] = str(values.get("回退状态") or "").strip() or "未提交"
+        return entry, missing
+
+    def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
+        """动作分派：执行变更保留备份，回退变更进入待目录确认的办理态。"""
+        handlers = {
+            "执行变更": self.execute_with_backup,
+            "回退变更": self.rollback_change,
+            "确认回退": self.confirm_rollback,
+        }
+        handler = handlers.get(action)
+        if handler is None:
+            return super().run_action(entry_id, action)
+        result = handler(entry_id)
+        entry = store.find(self.MODULE, entry_id) if result.get("ok") else None
+        return entry, result.get("message", "变更已处理")
 
     def assess_compatibility(self, entry_id: int) -> dict[str, Any]:
         """评估Schema变更的兼容性。
@@ -104,32 +127,127 @@ class SchemaChangeService(BaseModuleService):
         }
 
     def rollback_change(self, entry_id: int) -> dict[str, Any]:
-        """回退已执行的Schema变更。
+        """提交回退已执行的Schema变更（第一步：进入回退办理）。
 
-        使用执行前创建的备份快照恢复原始Schema，
-        记录回退原因和影响范围。
+        使用执行前创建的备份快照恢复原始Schema，记录回退原因和影响范围。
+        回退不会直接结案：先登记到目录待处理清单，等目标目录确认后
+        由 confirm_rollback 正式恢复列定义。
         """
         entry = store.find(self.MODULE, entry_id)
         if entry is None:
             return {"ok": False, "message": "变更记录不存在"}
+        if entry.get("status") == "已回退":
+            return {"ok": False, "message": "该变更已回退"}
         if entry.get("status") != "已执行":
             return {"ok": False, "message": "只有已执行的变更记录才能回退"}
+        if entry.get("回退状态") == "待目录确认":
+            return {"ok": False, "message": "回退已提交，等待目标目录确认"}
 
+        table = entry.get("目标表", "")
+        submitted = schema_registry.open_rollback(entry_id)
+        if submitted is None:
+            # 历史记录没有列级备份时，退回快照级回退，保持原有可回退范围。
+            return self._rollback_from_snapshot(entry, entry_id)
+
+        backup_columns = schema_registry.backup_columns(entry_id)
+        entry["回退状态"] = "待目录确认"
+        entry["pending"] = True
+        return {
+            "ok": True,
+            "change_id": entry_id,
+            "table": table,
+            "backup_columns": backup_columns,
+            "rollback": submitted,
+            "catalog_pending": schema_registry.catalog_pending(),
+            "message": "回退已提交，等待目标目录确认；确认前该列不可读，其它未撤销列保持可读",
+        }
+
+    def _rollback_from_snapshot(self, entry: dict[str, Any],
+                                entry_id: int) -> dict[str, Any]:
+        """兼容没有列级备份的历史记录：按执行前的快照级备份直接回退。"""
         snapshot_rows = store.rows("snapshot_creator")
         backup_snapshots = [
             s for s in snapshot_rows
             if f"_pre_change_{entry_id}" in s.get("存储路径", "")
         ]
-
+        if not backup_snapshots:
+            # 历史记录既无列级备份也无快照备份：按原行为登记回退结果。
+            entry["status"] = "已回退"
+            entry["回退状态"] = "已确认"
+            entry["pending"] = False
+            entry["abnormal"] = True
+            return {
+                "ok": True,
+                "change_id": entry_id,
+                "deployed_snapshot_id": None,
+                "message": "变更已回退，未找到备份快照，请人工核对目标表",
+            }
         entry["status"] = "已回退"
+        entry["回退状态"] = "已确认"
+        entry["pending"] = False
         entry["abnormal"] = True
-
         return {
             "ok": True,
             "change_id": entry_id,
-            "deployed_snapshot_id": backup_snapshots[0]["id"] if backup_snapshots else None,
-            "message": f"变更已回退，恢复自快照",
+            "deployed_snapshot_id": backup_snapshots[0]["id"],
+            "message": "变更已按执行前快照回退",
         }
+
+    def confirm_rollback(self, entry_id: int, catalog: str | None = None) -> dict[str, Any]:
+        """目录确认后正式结案（第二步）：按备份列恢复定义并锁定该列。"""
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None:
+            return {"ok": False, "message": "变更记录不存在"}
+        if entry.get("status") == "已回退":
+            return {"ok": False, "message": "该变更已回退"}
+        if entry.get("回退状态") != "待目录确认":
+            return {"ok": False, "message": "请先提交回退，再等待目录确认"}
+        pending = [
+            item for item in schema_registry.catalog_pending()
+            if item.get("change_id") == entry_id
+        ]
+        if not pending:
+            return {"ok": False, "message": "该变更不在目录待处理清单中"}
+
+        restored = schema_registry.restore_column(
+            entry_id, catalog=catalog or pending[0].get("catalog", ""))
+        if restored is None:
+            return {"ok": False, "message": "备份列恢复失败"}
+
+        entry["status"] = "已回退"
+        entry["回退状态"] = "已确认"
+        entry["pending"] = False
+        entry["abnormal"] = True
+        entry["变更时间"] = "2026-11-23T10:00:00Z"
+        action = (f"移除列 {restored['column']}" if restored.get("dropped")
+                  else f"把 {restored['column']} 恢复为 {restored['restored_type']}")
+        return {
+            "ok": True,
+            "change_id": entry_id,
+            "restored": restored,
+            "catalog_pending": schema_registry.catalog_pending(),
+            "message": f"目录已确认，按备份列 {restored['backup_column']} {action}，该列定义已锁定",
+        }
+
+    def rollback_evidence(self, entry_id: int) -> dict[str, Any]:
+        """回退依据：具体变更内容、备份列和目录确认状态，供结案前核对。"""
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None:
+            return {"ok": False, "message": "变更记录不存在"}
+        evidence = schema_registry.evidence(entry_id)
+        evidence["entry"] = {
+            "id": entry.get("id"),
+            "status": entry.get("status"),
+            "回退状态": entry.get("回退状态"),
+            "目标表": entry.get("目标表"),
+            "变更类型": entry.get("变更类型"),
+            "变更内容": entry.get("变更内容"),
+        }
+        evidence["can_close"] = (
+            entry.get("回退状态") == "待目录确认"
+            and bool(evidence["catalog_pending"])
+        )
+        return evidence
 
     def list_pending_changes_by_table(self, table_name: str) -> dict[str, Any]:
         """查询指定表的待处理Schema变更列表。

@@ -7,6 +7,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.schema_registry import DEMO_TABLE, schema_registry
 from app.store import store
 
 
@@ -19,6 +20,123 @@ class CatalogSyncService(BaseModuleService):
     STATUS_ORDER = ["待同步", "同步中", "已同步", "同步失败"]
     ACTION_RULES = {"启动同步": "待同步", "取消同步": "同步中"}
     NEGATIVE_ACTIONS = []
+
+    # ---------- Schema变更回退的目录环节 ----------
+    def pending_schema_rollbacks(self, entry_id: int | None = None) -> dict[str, Any]:
+        """目录待处理清单里的Schema变更回退项。
+
+        值班员据此看到哪一列正在回退、备份列是什么、要恢复成什么定义。
+        """
+        items = schema_registry.catalog_pending()
+        if entry_id is not None:
+            items = [item for item in items if item.get("change_id") == entry_id]
+        return {
+            "scope": "catalog_sync",
+            "pending_count": len(items),
+            "items": items,
+            "resolved": schema_registry.catalog_resolved(),
+        }
+
+    def confirm_schema_rollback(self, entry_id: int, change_id: int) -> dict[str, Any]:
+        """目录确认回退：使用备份列定义更新目标数据定义。
+
+        只更新回退涉及的列；同表其它已独立发布的列（如 channel）
+        保持目录中现有定义继续可读。
+        """
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None:
+            return {"ok": False, "message": "同步任务不存在"}
+        pending = [
+            item for item in schema_registry.catalog_pending()
+            if item.get("change_id") == change_id
+        ]
+        if not pending:
+            return {"ok": False, "message": "该变更不在目录待处理清单中"}
+        item = pending[0]
+        catalog = item.get("catalog", entry.get("目标Catalog", ""))
+        # 目录确认与变更结案走同一条路径，避免两处状态各自推进。
+        # 局部导入，避免 services 注册表与本模块互相依赖。
+        from app.services import service_for
+        schema_service = service_for("schema_change")
+        result = schema_service.confirm_rollback(change_id, catalog=catalog)
+        if not result.get("ok"):
+            return result
+        restored = result["restored"]
+        entry["同步状态"] = f"回退已确认: {restored['column']}"
+        entry["pending"] = bool(schema_registry.catalog_pending())
+        return {
+            "ok": True,
+            "task_id": entry_id,
+            "change_id": change_id,
+            "catalog": catalog,
+            "table": restored["table"],
+            "column": restored["column"],
+            "backup_column": restored["backup_column"],
+            "target_columns": restored["catalog_columns"],
+            "pending_after": schema_registry.catalog_pending(),
+            "message": result.get("message", ""),
+        }
+
+    def apply_sync_schema(self, entry_id: int, table: str = DEMO_TABLE,
+                          source_columns: dict[str, str] | None = None) -> dict[str, Any]:
+        """按同步来源的列定义更新目标数据定义（含迟到同步的重放）。
+
+        回退已确认的列会忽略同步携带的旧定义，只保留恢复后的定义。
+        """
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None:
+            return {"ok": False, "message": "同步任务不存在"}
+        catalog = entry.get("目标Catalog", "")
+        # 不指定列定义时，使用源端滞留的旧定义，这正是迟到同步会携带的内容。
+        record = schema_registry.apply_sync(table, source_columns, catalog=catalog)
+        entry["同步状态"] = "已完成" if not record["skipped"] else "部分应用-列定义已锁定"
+        entry["pending"] = bool(record["skipped"])
+        entry["abnormal"] = bool(record["skipped"])
+        skipped_columns = "、".join(item["column"] for item in record["skipped"])
+        return {
+            "ok": True,
+            "task_id": entry_id,
+            "table": table,
+            "catalog": catalog,
+            "applied": record["applied"],
+            "skipped": record["skipped"],
+            "message": "同步已落地" if not record["skipped"]
+            else f"{skipped_columns} 的同步定义被跳过：回退办理/锁定期间只保留恢复后的定义",
+        }
+
+    def sync_usage_report(self, table: str = DEMO_TABLE,
+                          catalog: str = "aws_glue_catalog") -> dict[str, Any]:
+        """目录与血缘里实际使用的列定义版本，以及读取可见性。"""
+        columns = schema_registry.table_columns(table)
+        usage = []
+        for column, column_type in columns.items():
+            state = schema_registry.column_read_state(table, column)
+            usage.append({
+                "column": column,
+                "defined_type": column_type,
+                "definition_source": state.get("definition_source", state.get("state")),
+                "readable": state["readable"],
+                "rollback_locked": state.get("rollback_locked", False),
+            })
+        catalog_lineage = [
+            row for row in store.rows("lineage_graph")
+            if row.get("目标表") == table
+        ]
+        return {
+            "table": table,
+            "catalog_columns": schema_registry.catalog_columns(catalog, table),
+            "columns": usage,
+            "lineage_versions": [
+                {
+                    "lineage_id": row.get("id"),
+                    "column_version": row.get("列定义版本", ""),
+                    "read_path": row.get("读取路径", ""),
+                }
+                for row in catalog_lineage
+            ],
+            "catalog_pending": schema_registry.catalog_pending(),
+            "sync_history": schema_registry.catalog_history(),
+        }
 
     def start_sync(self, entry_id: int, incremental: bool = True) -> dict[str, Any]:
         """启动目录同步任务。

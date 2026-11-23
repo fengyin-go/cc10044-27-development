@@ -70,3 +70,21 @@ body { margin: 0; background: #f6f8fb; color: #1f2937; }
 .analysis-chart { display: flex; align-items: flex-end; gap: 8px; height: 160px; padding: 12px 0; }
 .analysis-bar { flex: 1; border-radius: 4px 4px 0 0; background: var(--brand); min-width: 24px; position: relative; transition: height 0.4s; }
 .analysis-bar span { position: absolute; bottom: -20px; left: 50%; transform: translateX(-50%); font-size: 10px; color: var(--muted); white-space: nowrap; }
+/* Schema回退核对面板 */
+.rollback-panel { margin: 16px 0; background: #fff; border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+.panel-head { display: flex; justify-content: space-between; align-items: flex-start; }
+.panel-head h3 { margin: 0; font-size: 15px; }
+.panel-busy { color: var(--url, #1f6feb); font-size: 12px; }
+.panel-controls { display: flex; flex-wrap: wrap; gap: 10px; margin: 10px 0; }
+.panel-field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+.panel-field input { border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; font-size: 13px; width: 150px; }
+.panel-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.panel-result { margin-top: 12px; border-top: 1px solid var(--border); padding-top: 10px; }
+.panel-result-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.panel-flag { font-size: 12px; padding: 2px 8px; border-radius: 10px; }
+.flag-ok { background: #e7f7ee; color: #157347; }
+.flag-warn { background: #fdecec; color: #b42318; }
+.panel-kv { display: grid; grid-template-columns: 110px 1fr; gap: 4px 12px; margin: 0; }
+.panel-kv dt { font-size: 12px; color: var(--muted); }
+.panel-kv dd { font-size: 13px; margin: 0; }
+.panel-raw { margin-top: 10px; max-height: 220px; overflow: auto; background: #f6f8fb; border-radius: 6px; padding: 10px; font-size: 11px; }

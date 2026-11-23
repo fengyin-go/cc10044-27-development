@@ -71,6 +71,29 @@ npm run dev
 | 清理作业 | `cleanup_job` | 清理作业 | 作业名称、目标路径、清理条件 |
 | 目录同步 | `catalog_sync` | 同步任务 | 任务名称、源Catalog、目标Catalog |
 
+## Schema变更的回退流转
+
+Schema变更不再一步到位改成「已回退」，而是「提交回退 → 目录确认 → 结案」两段式：
+
+1. `POST /api/schema_change/{id}/actions`，`action=回退变更`：登记备份列，
+   写入目录待处理清单，变更记录进入「待目录确认」。此时被撤销的列不可读，
+   同表其它未撤销的列（例如后来独立新增的 channel）继续可读。
+2. `GET /api/schema_change/{id}/rollback-evidence`：核对具体变更、备份列和目录待处理项。
+3. `POST /api/catalog_sync/{sync_id}/confirm-rollback`：目录确认，使用备份列定义
+   更新目标数据定义，该列定义随即锁定，变更记录转为「已回退」。也可以用
+   `POST /api/schema_change/{id}/actions`，`action=确认回退` 走同一条结案路径。
+
+回退确认后重放迟到同步（`POST /api/catalog_sync/{sync_id}/apply-schema`）时，
+锁定列只保留恢复后的定义，同步携带的旧类型会被跳过并记录在同步历史里。
+
+报表读取（`/api/report/amount-sum`、`/api/report/channel-data`、
+`/api/report/column-definitions`）始终沿当前读路径取数：金额列在回退办理期间
+返回「回退办理中」和目录待处理项，而不是不可靠数值；渠道列照常返回数据。
+`GET /api/catalog_sync/{sync_id}/sync-usage` 给出目录与血缘里实际使用的列定义版本。
+
+演示表 `order_fact_v3` 的两笔金额为 12.50 和 3.25（合计 15.75），
+变更 4 是 amount 由 DECIMAL(10,2) 改为 STRING，变更 5 是后续新增 channel。
+
 ## 约定
 
 - 全部模块共享`frontend/src/views/WorkbenchView.vue|tsx`和一套资源路由。
